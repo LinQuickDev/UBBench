@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdbool.h>
 
@@ -94,7 +95,7 @@ static void *sequential_worker(void *arg)
         int cqe_cnt;
         do {
             cqe_cnt = urma_poll_jfc(ctx->jfc_s[id], 1, &cr);
-        } while (cqe_cnt == 0 &&
+        } while (cqe_cnt == 0 && !run_ctx->abort &&
                  (cfg->time_type.bs.iterations == 1 || run_ctx->state != END_STATE));
 
         if (cqe_cnt < 0) {
@@ -106,7 +107,15 @@ static void *sequential_worker(void *arg)
             break;
         }
         if (cr.status != URMA_CR_SUCCESS) {
-            LOG_ERROR("Bad CR status, thread %u, status %d.\n", id, (int)cr.status);
+            if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                          cr_status_str((int)cr.status), (int)cr.status, id);
+                if (cr.status == URMA_CR_ACK_TIMEOUT_ERR) {
+                    LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                } else if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                    LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                }
+            }
             t->end_time = get_cycles();
             return (void *)(intptr_t)(-1);
         }
@@ -169,7 +178,13 @@ static void *recv_server_worker(void *arg)
 
     t->start_time = get_cycles();
 
+    time_t last_recv_time = time(NULL);
+    uint64_t idle_count = 0;
+
     while (1) {
+        if (run_ctx->abort) {
+            break;
+        }
         if (cfg->time_type.bs.duration == 1) {
             if (run_ctx->state == END_STATE) {
                 break;
@@ -184,9 +199,29 @@ static void *recv_server_worker(void *arg)
             return (void *)(intptr_t)(-1);
         }
 
+        if (cqe_cnt > 0) {
+            last_recv_time = time(NULL);
+            idle_count = 0;
+        } else if (++idle_count % 1000000 == 0) {
+            if (time(NULL) - last_recv_time > 10) {
+                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                    LOG_ERROR("Timeout: no data for 10s, peer may have disconnected.\n");
+                }
+                break;
+            }
+        }
+
         for (int i = 0; i < cqe_cnt; i++) {
             if (cr[i].status != URMA_CR_SUCCESS) {
-                LOG_ERROR("Bad CR status, thread %u, status %d.\n", id, (int)cr[i].status);
+                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                    LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                              cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                    if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+                        LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                    } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                        LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                    }
+                }
                 free(cr);
                 t->end_time = get_cycles();
                 return (void *)(intptr_t)(-1);
@@ -298,7 +333,6 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
     LOG_QUIET("\n");
-    LOG_QUIET("---- ub_bench Report ----\n");
     if (cfg->bw_only == false) {
         double t_avg_us = hist_avg(merged_hist) / cpu_mhz;
         double t_min_us = (merged_hist->min_delta < (uint64_t)-1) ?
@@ -310,17 +344,17 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
         uint64_t p99999 = hist_percentile(merged_hist, 0.99999);
         uint64_t pmax = merged_hist->max_delta;
 
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                   unit_str);
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   t_min_us, (double)pmax / cpu_mhz, (double)p50 / cpu_mhz, t_avg_us,
                   (double)p99 / cpu_mhz, (double)p999 / cpu_mhz,
                   (double)p9999 / cpu_mhz, (double)p99999 / cpu_mhz);
     } else {
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
-        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
+        LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
                   cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
@@ -351,25 +385,24 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     double actual_qps = (double)data->total_count * cycles_to_units / (double)cycles_sum;
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
-    if (header) {
-        LOG_QUIET("\n");
-        LOG_QUIET("---- ub_bench Report ----\n");
-    }
+        if (header) {
+            LOG_QUIET("\n");
+        }
     if (data->bw_only == false) {
         if (header) {
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+            LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                       unit_str);
         }
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   data->t_min, data->pmax, data->t_median, data->t_avg,
                   data->p99, data->p999, data->p9999, data->p99999);
     } else {
         if (header) {
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+            LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
         }
-        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
@@ -451,6 +484,7 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
     }
 
     if (worker_err != 0) {
+        ctx->run_ctx.abort = 1;
         free(args);
         return -1;
     }
@@ -596,7 +630,7 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
         }
 
         if (worker_err != 0) {
-            LOG_ERROR("Worker thread failed in sweep step %u.\n", s);
+            ctx->run_ctx.abort = 1;
             free(args);
             free(results);
             return -1;
@@ -671,15 +705,11 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     LOG_QUIET("\n");
-    LOG_QUIET("==== ub_bench Sweep Report ====\n");
-    LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
-              cfg->threads, cfg->size, cfg->sweep_duration);
-    LOG_QUIET("\n");
-    LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-              "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+    LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
+              "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
               unit_str);
     for (uint32_t s = 0; s < cfg->sweep_steps; s++) {
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   cfg->size,
                   results[s].total_count,
                   results[s].actual_total_qps,
@@ -746,6 +776,7 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     if (worker_err != 0) {
+        ctx->run_ctx.abort = 1;
         free(args);
         return -1;
     }
@@ -855,12 +886,8 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
             const char *srv_unit_str = (cfg->bw_unit == PERFTEST_KB) ? "KiB" :
                                        (cfg->bw_unit == PERFTEST_GB) ? "GiB" : "MiB";
             LOG_QUIET("\n");
-            LOG_QUIET("==== ub_bench Sweep Report ====\n");
-            LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
-                      cfg->threads, cfg->size, cfg->sweep_duration);
-            LOG_QUIET("\n");
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+            LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                       srv_unit_str);
         }
         for (uint32_t s = 0; s < loop_count; s++) {
